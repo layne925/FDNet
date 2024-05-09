@@ -19,7 +19,7 @@ from mmseg.models.builder import BACKBONES
 BatchNorm2d = nn.BatchNorm2d
 BatchNorm1d = nn.BatchNorm1d
 
-from .ops_dcnv3.modules.my_dcnv3 import SDConv_stage
+
 
 
 
