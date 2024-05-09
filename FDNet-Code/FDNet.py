@@ -101,6 +101,203 @@ class PatchExpand(nn.Module):
         return x
 
 
+def sdconv_core_pytorch(
+        input, offset, mask, kernel_h,
+        kernel_w, stride_h, stride_w, pad_h,
+        pad_w, dilation_h, dilation_w, group,
+        group_channels, offset_scale):
+    # for debug and test only,
+    # need to use cuda version instead
+    input = F.pad(
+        input,
+        [0, 0, pad_h, pad_h, pad_w, pad_w])
+    N_, H_in, W_in, _ = input.shape
+    _, H_out, W_out, _ = offset.shape
+
+    ref = _get_reference_points(
+        input.shape, input.device, kernel_h, kernel_w, dilation_h, dilation_w, pad_h, pad_w, stride_h, stride_w)
+    
+    # 对input生成网格位置
+    grid = _generate_dilation_grids(
+        input.shape, kernel_h, kernel_w, dilation_h, dilation_w, group, input.device)
+    spatial_norm = torch.tensor([W_in, H_in]).reshape(1, 1, 1, 2).\
+        repeat(1, 1, 1, group*kernel_h*kernel_w).to(input.device) # 高宽作为分母，那自然offset是0-1的
+
+    # print(f'offset {offset.shape} norm {spatial_norm.shape}')
+    sampling_locations = (ref + grid * offset_scale).repeat(N_, 1, 1, 1, 1).flatten(3, 4) + \
+        offset * offset_scale / spatial_norm # TODO 如何约束cross元素的移动
+    
+    
+    
+    P_ = kernel_h * kernel_w
+
+    # 说明sample-location是【0,1】的 *2-1 会把offset 移到【-1,1】
+    sampling_grids = 2 * sampling_locations - 1 # 计算采样的网络 则是对采样位置进行一个线性变换。乘以2会扩大位置范围，然后减去1会将位置平移到[-1, 1]范围内
+    # N_, H_in, W_in, group*group_channels -> N_, H_in*W_in, group*group_channels -> N_, group*group_channels, H_in*W_in -> N_*group, group_channels, H_in, W_in
+    input_ = input.view(N_, H_in*W_in, group*group_channels).transpose(1, 2).\
+        reshape(N_*group, group_channels, H_in, W_in) # 分组
+    # N_, H_out, W_out, group*P_*2 -> N_, H_out*W_out, group, P_, 2 -> N_, group, H_out*W_out, P_, 2 -> N_*group, H_out*W_out, P_, 2
+    sampling_grid_ = sampling_grids.view(N_, H_out*W_out, group, P_, 2).transpose(1, 2).\
+        flatten(0, 1) # 采样位置 b*group,h*w,p,2
+    
+    # N_*group, group_channels, H_out*W_out, P_
+    sampling_input_ = F.grid_sample( # 采样插值 对输入图像进行网格采样，即使用采样网格在输入图像上进行插值，以获得在卷积操作中所需的特征。
+        input_, sampling_grid_, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+    # (N_, H_out, W_out, group*P_) -> N_, H_out*W_out, group, P_ -> (N_, group, H_out*W_out, P_) -> (N_*group, 1, H_out*W_out, P_)
+    mask = mask.view(N_, H_out*W_out, group, P_).transpose(1, 2).\
+        reshape(N_*group, 1, H_out*W_out, P_) # 分组的
+    # 遮罩操作：将采样的结果与遮罩进行逐元素相乘。遮罩指示了哪些位置的特征应该参与计算，这一步类似于卷积中的权重操作。
+    # 对采样 乘掩码 即卷积核权重，会有一个sum求和
+    output = (sampling_input_ * mask).sum(-1).view(N_,
+                                                   group*group_channels, H_out*W_out)
+    # p维度求和 p=k_w*k_h 相当于卷积求和了，b,head*c/head, h*w--> b,h,w,c
+
+    return output.transpose(1, 2).reshape(N_, H_out, W_out, -1).contiguous()
+
+
+
+class SDConv_stage(nn.Module):
+    """ 加入sd约束变形，kersize=5"""
+    def __init__(
+            self,
+            channels=64,
+            kernel_size=3,
+            dw_kernel_size=None,
+            stride=1,
+            pad=1,
+            dilation=1,
+            
+            group=16,
+            offset_scale=1.0,
+            act_layer='GELU',
+            norm_layer='LN',
+            center_feature_scale=False):
+   
+        super().__init__()
+        if channels % group != 0:
+            raise ValueError(
+                f'channels must be divisible by group, but got {channels} and {group}')
+        _d_per_group = channels // group
+        dw_kernel_size = dw_kernel_size if dw_kernel_size is not None else kernel_size
+        # you'd better set _d_per_group to a power of 2 which is more efficient in our CUDA implementation
+        if not _is_power_of_2(_d_per_group):
+            warnings.warn(
+                "You'd better set channels in DCNv3 to make the dimension of each attention head a power of 2 "
+                "which is more efficient in our CUDA implementation.")
+
+        self.offset_scale = offset_scale
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.dw_kernel_size = dw_kernel_size
+        self.stride = stride
+        self.dilation = dilation
+        self.pad = pad
+        self.group = group
+        self.group_channels = channels // group
+        self.offset_scale = offset_scale
+        self.center_feature_scale = center_feature_scale
+        
+        self.dw_conv = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=dw_kernel_size,
+                stride=1,
+                padding=(dw_kernel_size - 1) // 2,
+                groups=channels),
+            build_norm_layer(
+                channels,
+                norm_layer,
+                'channels_first',
+                'channels_last'),
+            build_act_layer(act_layer))
+        self.offset = nn.Linear(
+            channels,
+            group * kernel_size * kernel_size * 2)
+        self.mask = nn.Linear(
+            channels,
+            group * kernel_size * kernel_size)
+        self.input_proj = nn.Linear(channels, channels)
+        self.output_proj = nn.Linear(channels, channels)
+        self._reset_parameters()
+        
+        if center_feature_scale:
+            self.center_feature_scale_proj_weight = nn.Parameter(
+                torch.zeros((group, channels), dtype=torch.float))
+            self.center_feature_scale_proj_bias = nn.Parameter(
+                torch.tensor(0.0, dtype=torch.float).view((1,)).repeat(group, ))
+            self.center_feature_scale_module = CenterFeatureScaleModule()
+
+    def _reset_parameters(self):
+        constant_(self.offset.weight.data, 0.)
+        constant_(self.offset.bias.data, 0.)
+        constant_(self.mask.weight.data, 0.)
+        constant_(self.mask.bias.data, 0.)
+        xavier_uniform_(self.input_proj.weight.data)
+        constant_(self.input_proj.bias.data, 0.)
+        xavier_uniform_(self.output_proj.weight.data)
+        constant_(self.output_proj.bias.data, 0.)
+
+    def forward(self, input):
+        """
+        :param query                       (N, H, W, C)
+        :return output                     (N, H, W, C)
+        """
+        N, H, W, _ = input.shape
+        # print(f'heere is hf ')
+
+        x = self.input_proj(input)
+        x_proj = x
+        dtype = x.dtype
+
+        x1 = input.permute(0, 3, 1, 2)
+        x1 = self.dw_conv(x1)
+        offset = self.offset(x1)
+
+            # TODO 对offset的cross 进行约束控制
+        offset = offset.reshape(N,self.group,self.kernel_size,self.kernel_size,2,H,W) # b,g,kw,kh,2,h,w
+        # offset_new = torch.zeros_like(offset) #0矩阵
+        center = int(self.kernel_size//2)
+        for index in range(1, center+1): # 迭代过程 1--center
+            # new的k/2+i = new k/2+i的左边 + 原来的k/2+i
+            # new的k/2-i = new k/2-i的右边 + 原来的k/2-i
+            # 偏移来自上一个核元素的约束
+            # 行 
+            offset[:,:,center,center+index,:,:] = offset[:,:,center,center+index-1,:,:]+ offset[:,:,center,center+index,:,:]
+            offset[:,:,center,center-index,:,:] = offset[:,:,center,center-index+1,:,:]+ offset[:,:,center,center-index,:,:]
+            # 列
+            offset[:,:,center+index,center,:,:] = offset[:,:,center+index-1,center,:,:]+ offset[:,:,center+index,center,:,:]
+            offset[:,:,center-index,center,:,:] = offset[:,:,center-index+1,center,:,:]+ offset[:,:,center-index,center,:,:]
+       
+ 
+    
+        offset = offset.reshape(N,self.group*self.kernel_size*self.kernel_size*2,H,W) # b,g*kw*kh*2,h,w
+
+        mask = self.mask(x1).reshape(N, H, W, self.group, -1)
+        mask = F.softmax(mask, -1).reshape(N, H, W, -1).type(dtype)
+
+    
+          x = sdconv_core_pytorch(
+            x, offset, mask,
+            self.kernel_size, self.kernel_size,
+            self.stride, self.stride,
+            self.pad, self.pad,
+            self.dilation, self.dilation,
+            self.group, self.group_channels,
+            self.offset_scale)
+        
+        if self.center_feature_scale:
+            center_feature_scale = self.center_feature_scale_module(
+                x1, self.center_feature_scale_proj_weight, self.center_feature_scale_proj_bias)
+            # N, H, W, groups -> N, H, W, groups, 1 -> N, H, W, groups, _d_per_group -> N, H, W, channels
+            center_feature_scale = center_feature_scale[..., None].repeat(
+                1, 1, 1, 1, self.channels // self.group).flatten(-2)
+            x = x * (1 - center_feature_scale) + x_proj * center_feature_scale
+        x = self.output_proj(x)
+
+        return x
+
 class PatchMerging(nn.Module):
     r""" Patch Merging Layer.
 
