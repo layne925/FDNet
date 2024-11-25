@@ -27,7 +27,7 @@ SIZE=448
 # SIZE=512 
 
 def complex_gelu(input):
-    return F.gelu(input.real).type(torch.complex64)+1j*F.gelu(input.imag).type(torch.complex64)
+    return F.gelu(input.real).type(torch.complex64)+1j*F.gelu(input.imag).type(torch.complex64) ##
 
 class Down(nn.Module):
     """Downscaling with maxpool then double conv"""
